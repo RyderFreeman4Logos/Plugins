@@ -88,6 +88,27 @@ is a lookup rather than a guess about which blocks are yours.
 Also not stored: the model's encrypted reasoning, the UI's echo of messages
 already recorded, and the memory block this plugin itself injected.
 
+## Ambiguous writes
+
+Add/flush persists an exclusive intent **before** POST, scoped to endpoint, app,
+project and session, with a turn/snapshot digest. A timeout, lost response,
+malformed acknowledgment or failed local settlement means **UNKNOWN / HOLD**,
+not saved/flushed success. Repeated Stop, lifecycle flushes and abandoned sweeps
+must not replay that operation. New turns in the held partition are blocked too.
+The hook reports HOLD even with verbose/debug disabled.
+
+`EVEROS_CODEX_DATA_DIR/state/writes/<scope-digest>/intent/unknown.json` records
+identifiers/counts/digests only; `settled.json` retains acknowledged batch prefixes
+and completed captures/flush revisions. An empty intent directory also means
+HOLD (crash during persistence). These records are not TTL-pruned. Do not delete
+intent or settlement records to retry: an accepted write could be duplicated.
+Reconciliation needs exact-operation evidence; health checks and empty search
+results do not prove nonacceptance. There is no automatic recovery/status API
+here, nor a guarantee of eventual extraction. This change does not establish
+live latency causes or alter `defer_extraction`. Pre-journal ambiguous writes
+cannot be reconstructed from the old best-effort cache; reconcile them before
+rollout, without replaying old canaries.
+
 ## Porting notes
 
 Two differences from the Claude Code plugin will silently disable every hook if
@@ -107,6 +128,14 @@ you assume the obvious thing. Both were found by checking, not by reading docs:
   hook ran. No feature flag is involved; the location is the whole of it.
 
 ## Verification
+
+From the repository root, `just codex-fast` runs package tests/manifests and
+marketplace validation with Bubblewrap, no network and a synthetic HOME. Needs
+Linux, Bubblewrap, Just, Node/npm and SSD `$HOME/tmp`. For the release matrix:
+`just codex-full /path/to/node20 /path/to/node22` (both exact major versions are
+required). Lefthook runs the fast route at commit; install with `lefthook install`.
+The live scripts below are separate, explicitly authorized integration gates,
+not part of the offline test route.
 
 ```bash
 ./scripts/hooks-contract.sh   # the four hooks against a REAL EverOS

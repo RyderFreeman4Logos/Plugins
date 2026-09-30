@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { PROMPT_KEY_MAX_CHARS, STATE_MAX_PROMPT_IDS, STATE_MAX_PROMPTS, STATE_TTL_DAYS } from "./constants.js";
 import { sanitizeId } from "./identity.js";
 
@@ -41,8 +42,7 @@ export function readState(dataDir, sessionId) {
 
 /**
  * Write via a temporary file and rename. Two Claude Code windows share this
- * directory, and the sweep in one can write another's file: a reader must never
- * see a half-written document, and a lost update means a turn is captured twice.
+ * directory, and a reader must never see a half-written prompt/liveness cache.
  */
 function writeState(dataDir, sessionId, state) {
   const file = statePath(dataDir, sessionId);
@@ -54,13 +54,8 @@ function writeState(dataDir, sessionId, state) {
     fs.chmodSync(temp, 0o600);
     fs.renameSync(temp, file);
   } catch {
-    // This directory is a cache for dedupe and liveness, never the memory
-    // itself. An unwritable one (read-only home, a full disk, a dataDir left
-    // owned by root) used to throw out of touchSession - which recall calls
-    // before it searches - and the hook exited 0 with nothing injected:
-    // memory silently gone, no error anywhere. Degrade instead. What is lost
-    // is dedupe (a re-fired Stop may store a turn twice) and the liveness
-    // mtime. `/everos:status` probes this directory and says so.
+    // Prompt/liveness cache only: recall can still work when this is unwritable.
+    // Side-effect dedupe and settlement use the fail-closed durable journal below.
   }
 }
 
@@ -150,7 +145,7 @@ export function pendingFlushes(dataDir, idleMs) {
       // future. Floor it so idleMs = 0 means "no idle requirement".
       if (Math.floor(fs.statSync(file).mtimeMs) > cutoff) continue;
       const state = parseState(JSON.parse(fs.readFileSync(file, "utf8")));
-      if (state.flushed || state.promptIds.length === 0) continue;
+      if (state.flushed || state.promptIds.length === 0 || hasUnknownWrite(dataDir, state.sessionId)) continue;
       if (state.sessionId) pending.push({ sessionId: state.sessionId, projectId: state.projectId });
     } catch { /* unreadable or racing; skip */ }
   }
@@ -176,8 +171,102 @@ export function pruneState(dataDir, ttlDays = STATE_TTL_DAYS) {
     if (!name.endsWith(".json")) continue;
     const file = path.join(dir, name);
     try {
+      const state = parseState(JSON.parse(fs.readFileSync(file, "utf8")));
+      if (hasUnknownWrite(dataDir, state.sessionId)) continue;
       if (fs.statSync(file).mtimeMs < cutoff) { fs.unlinkSync(file); removed += 1; }
     } catch { /* raced with another window; nothing to do */ }
   }
   return removed;
+}
+
+export const WRITE_HOLD = { systemMessage: "⚠️ EverOS: write outcome UNKNOWN / HOLD. Automatic add/flush replay is blocked; explicit reconciliation is required." };
+export const writeDigest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+function syncDirectory(dir) {
+  const fd = fs.openSync(dir, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+function durableDirectory(dir) {
+  if (fs.existsSync(dir)) { syncDirectory(path.dirname(dir)); return; }
+  durableDirectory(path.dirname(dir));
+  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (error) { if (error.code !== "EEXIST") throw error; }
+  syncDirectory(path.dirname(dir));
+}
+
+function durableJson(file, value) {
+  const fd = fs.openSync(file, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(value));
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+  syncDirectory(path.dirname(file));
+}
+
+/** Partition-bound journal, separate from the best-effort prompt/liveness cache.
+ * An exclusive intent directory is NEVER recovered by age or process liveness.
+ * Even an empty directory (crash before intent write) means UNKNOWN. Settled
+ * receipts are retained, so TTL pruning cannot make an acknowledged turn new.
+ * ponytail: one writer per partition/session; no automatic recovery protocol.
+ */
+export function claimWrite(dataDir, scope, operation) {
+  const dir = path.join(stateDir(dataDir), "writes", writeDigest(scope));
+  const hold = path.join(dir, "intent");
+  durableDirectory(dir);
+  // The best-effort cache may have created state/dataDir earlier without syncing.
+  syncDirectory(dataDir);
+  syncDirectory(path.dirname(dataDir));
+  try { fs.mkdirSync(hold, { mode: 0o700 }); } catch (error) {
+    if (error.code === "EEXIST") return null;
+    throw error;
+  }
+  syncDirectory(dir);
+  const file = path.join(dir, "settled.json");
+  let journal = { scope, captures: {}, revision: 0, flushedRevision: null };
+  try { journal = JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (writeDigest(journal.scope) !== writeDigest(scope) || !isPlainObject(journal.captures)
+      || !Number.isSafeInteger(journal.revision) || journal.revision < 0
+      || !(journal.flushedRevision === null || Number.isSafeInteger(journal.flushedRevision))) {
+    throw new Error("invalid write settlement; HOLD");
+  }
+  const claim = { dir, hold, file, journal };
+  // Store only identifiers, counts and digests: no transcript payload or error body.
+  durableJson(path.join(hold, "unknown.json"), { outcome: "UNKNOWN", scope, ...operation, revision: journal.revision });
+  return claim;
+}
+
+/** Called only with the exclusive claim. Failure deliberately leaves intent held. */
+export function settleWrite(claim) {
+  const temp = `${claim.file}.${process.pid}.tmp`;
+  durableJson(temp, claim.journal);
+  fs.renameSync(temp, claim.file);
+  syncDirectory(claim.dir);
+}
+
+/** Release only AFTER matching acknowledged state is durably settled. */
+export function releaseWrite(claim) {
+  fs.unlinkSync(path.join(claim.hold, "unknown.json"));
+  fs.rmdirSync(claim.hold);
+  syncDirectory(claim.dir);
+}
+
+function hasUnknownWrite(dataDir, sessionId) {
+  const root = path.join(stateDir(dataDir), "writes");
+  let names;
+  try { names = fs.readdirSync(root); } catch (error) { return error.code !== "ENOENT"; }
+  for (const name of names) {
+    const hold = path.join(root, name, "intent");
+    if (!fs.existsSync(hold)) continue;
+    try {
+      const intent = JSON.parse(fs.readFileSync(path.join(hold, "unknown.json"), "utf8"));
+      if (intent.scope?.sessionId === sanitizeId(sessionId, "unknown")) return true;
+    } catch { return true; } // Incomplete/corrupt intent must not enable a sweep.
+  }
+  return false;
+}
+
+export function writeScope(config, identity, sessionId) {
+  return { baseUrl: config.baseUrl, appId: identity.appId, projectId: identity.projectId, sessionId: sanitizeId(sessionId, "unknown") };
 }

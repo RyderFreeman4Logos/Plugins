@@ -1,0 +1,5 @@
+pre-commit:
+  commands:
+    codex-fast:
+      glob: "{codex/**,justfile,lefthook.yml}"
+      run: just codex-fast
