@@ -167,7 +167,7 @@ for (const script of ["capture", "flush"]) {
     assert.match(hook(f, script, "ack").stdout, /UNKNOWN|HOLD/);
     assert.equal(requests(f).length, 0);
   });
-  for (const mode of ["intent-directory-fsync", "settle-directory-fsync", "settle-crash"]) {
+  for (const mode of ["intent-directory-fsync", "settle-directory-fsync", "settle-postrename-directory-fsync", "settle-crash"]) {
     test(`${script}: ${mode} is fail-closed`, () => {
       const f = fixture();
       hook(f, script, mode);

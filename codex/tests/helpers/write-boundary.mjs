@@ -11,10 +11,12 @@ childProcess.default.spawn = (...args) => {
 };
 const mode = process.env.WRITE_MODE;
 let acknowledged = false;
+let renamedSettlement = false;
 for (const name of ["fsyncSync", "renameSync", "writeFileSync"]) {
   const original = fs[name];
   fs[name] = (...args) => {
     if (name === "fsyncSync" && fs.fstatSync(args[0]).isDirectory()) {
+      if (renamedSettlement && mode === "settle-postrename-directory-fsync") throw new Error("synthetic post-rename directory sync fault");
       if ((mode === "intent-directory-fsync" && fs.readlinkSync(`/proc/self/fd/${args[0]}`).endsWith("/intent")) || (acknowledged && mode === "settle-directory-fsync")) throw new Error("synthetic directory sync fault");
       if (mode === "crash-before-send" && fs.readlinkSync(`/proc/self/fd/${args[0]}`).endsWith("/intent")) {
         original(...args); process.exit(0);
@@ -24,7 +26,9 @@ for (const name of ["fsyncSync", "renameSync", "writeFileSync"]) {
     if (mode === `intent-${name}` || (acknowledged && mode === `settle-${name}`)) {
       throw Object.assign(new Error("synthetic persistence fault"), { code: "EIO" });
     }
-    return original(...args);
+    const result = original(...args);
+    if (name === "renameSync" && String(args[1]).endsWith("/settled.json")) renamedSettlement = true;
+    return result;
   };
 }
 syncBuiltinESMExports();
