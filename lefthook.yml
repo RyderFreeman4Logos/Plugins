@@ -3,3 +3,8 @@ pre-commit:
     codex-fast:
       glob: "{codex/**,justfile,lefthook.yml}"
       run: just codex-fast
+pre-push:
+  commands:
+    codex-admission:
+      run: node codex/scripts/pre-push-admission.mjs verify
+      use_stdin: true

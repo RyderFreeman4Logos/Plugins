@@ -107,3 +107,27 @@ integrations.
 ## License
 
 [Apache-2.0](./LICENSE)
+
+## Local Codex pre-push admission
+
+The hook accepts one non-deletion update of the checked-out feature branch only, after exact-HEAD Node 20/22 full-gate and native whole-range review receipts. It validates receipt/report/log hashes and candidate identities; it does not rerun tests. Keep evidence outside the checkout in mode-0700 `~/tmp` on the approved SSD. The offline gate and tests run in Bubblewrap with no network or host HOME.
+
+From the repository root, record the full gate after the candidate is committed:
+
+```sh
+TMPROOT="$(realpath "$HOME/tmp")"
+HEAD="$(git rev-parse HEAD)"
+NODE20="$(mise where node@20)/bin/node"
+NODE22="$(mise where node@22)/bin/node"
+ID="plugins-$HEAD"
+node codex/scripts/pre-push-admission.mjs record-gate "$(command -v just)" "$NODE20" "$NODE22" "$TMPROOT/$ID-full.log" "$TMPROOT/$ID-gate.json"
+```
+
+After an independent full-range native review, preserve its complete report under `TMPROOT` and ensure it contains the exact Candidate, Tree, Base, Range, Scope, and final `VERDICT: PASS` lines used by the admission receipt. Then record and select both receipts:
+
+```sh
+node codex/scripts/pre-push-admission.mjs record-review "$TMPROOT/$ID-review.md" "$TMPROOT/$ID-review.json"
+export CODEX_GATE_RECEIPT="$TMPROOT/$ID-gate.json" CODEX_REVIEW_RECEIPT="$TMPROOT/$ID-review.json"
+```
+
+The gate/review commands refuse existing output files; use a new `ID` for each candidate/run. The hook is intentionally feature-branch-only; it rejects multi-ref pushes, deletions, default branches, stale candidates, and mismatched stdin refs.
