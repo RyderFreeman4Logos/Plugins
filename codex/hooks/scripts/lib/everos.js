@@ -51,9 +51,10 @@ export function createClient({ baseUrl, fetchImpl = fetch }) {
       throw new EverosError(res.status, undefined, `${method} ${path}: non-JSON response (HTTP ${res.status})`, path);
     }
 
-    if (res.ok && parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        && typeof parsed.request_id === "string" && parsed.request_id.length > 0
-        && !parsed.error && parsed.data && typeof parsed.data === "object" && !Array.isArray(parsed.data)) return parsed.data;
+    if (res.ok && parsed && typeof parsed === "object" && "data" in parsed
+        && (path === "/api/v2/memory/search" || (!Array.isArray(parsed)
+          && typeof parsed.request_id === "string" && parsed.request_id.length > 0
+          && !parsed.error && parsed.data && typeof parsed.data === "object" && !Array.isArray(parsed.data)))) return parsed.data;
     const err = parsed?.error;
     if (err) throw new EverosError(res.status, err.code, err.message ?? `${path} failed`, err.path ?? path);
     throw new EverosError(res.status, undefined, `${path}: unexpected response (HTTP ${res.status})`, path);

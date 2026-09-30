@@ -7,6 +7,13 @@ import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { markStored, readState, rememberPrompt, statePath, pruneState } from "../hooks/scripts/lib/state.js";
 import { ADD_MAX_MESSAGES } from "../hooks/scripts/lib/constants.js";
+import { createClient } from "../hooks/scripts/lib/everos.js";
+
+test("search keeps its existing read-only envelope compatibility", async () => {
+  const expected = { episodes: [] };
+  const client = createClient({ baseUrl: "http://synthetic.invalid", fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ data: expected }) }) });
+  assert.deepEqual(await client.search({}), expected);
+});
 
 const plugin = fileURLToPath(new URL("../", import.meta.url));
 const boundary = path.join(plugin, "tests/helpers/write-boundary.mjs");
