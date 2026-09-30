@@ -16,6 +16,11 @@ for (const name of ["fsyncSync", "renameSync", "writeFileSync"]) {
   const original = fs[name];
   fs[name] = (...args) => {
     if (name === "fsyncSync" && fs.fstatSync(args[0]).isDirectory()) {
+      const directory = fs.readlinkSync(`/proc/self/fd/${args[0]}`);
+      if (mode === "release-directory-fsync" && fs.existsSync(`${directory}/settled.json`) && !fs.existsSync(`${directory}/intent/unknown.json`)) {
+        fs.appendFileSync(process.env.WRITE_REQUESTS + ".fault", "release\n");
+        throw new Error("synthetic release directory sync fault");
+      }
       if (renamedSettlement && mode === "settle-postrename-directory-fsync") throw new Error("synthetic post-rename directory sync fault");
       if ((mode === "intent-directory-fsync" && fs.readlinkSync(`/proc/self/fd/${args[0]}`).endsWith("/intent")) || (acknowledged && mode === "settle-directory-fsync")) throw new Error("synthetic directory sync fault");
       if (mode === "crash-before-send" && fs.readlinkSync(`/proc/self/fd/${args[0]}`).endsWith("/intent")) {

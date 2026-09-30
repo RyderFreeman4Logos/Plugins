@@ -196,6 +196,66 @@ test("recognized no_extraction acknowledgment still settles normally", () => {
   assert.equal(requests(f).length, 2);
 });
 
+test("add rejects flush-only no_extraction acknowledgment", () => {
+  const f = fixture();
+  assert.match(hook(f, "capture", "no-extraction").stdout, /UNKNOWN|HOLD/);
+  assert.ok(!readState(f.dir, "s1").promptIds.includes("t1"));
+  hook(f, "capture", "ack");
+  assert.equal(requests(f).length, 1);
+});
+for (const script of ["capture", "flush"]) {
+  test(`${script}: release-directory-fsync retains HOLD separately from settlement`, () => {
+    const f = fixture();
+    assert.match(hook(f, script, "release-directory-fsync").stdout, /UNKNOWN|HOLD/);
+    assert.equal(fs.readFileSync(f.requests + ".fault", "utf8"), "release\n", "exact release fence exercised once");
+    assert.ok(jsonFiles(f.dir).some((j) => script === "capture" ? Object.values(j.captures ?? {}).some((c) => c.complete) : j.flushedRevision === 0), "acknowledgment survives release uncertainty");
+    fs.writeFileSync(f.transcript, fs.readFileSync(f.transcript, "utf8").replaceAll('"t1"', '"t2"'));
+    assert.match(hook(f, "capture", "ack", {}, { turn_id: "t2" }).stdout, /UNKNOWN|HOLD/);
+    assert.match(hook(f, "flush", "ack").stdout, /UNKNOWN|HOLD/);
+    assert.equal(requests(f).length, 1);
+  });
+}
+const corruptions = {
+  "inconsistent complete": (j, c) => { c.acknowledged = 0; },
+  "negative flushed revision": (j) => { j.flushedRevision = -1; },
+  "future flushed revision": (j) => { j.flushedRevision = j.revision + 1; },
+  "fractional revision": (j) => { j.revision = 0.5; },
+  "revision/count mismatch": (j) => { j.revision = 0; },
+  "unsafe revision": (j) => { j.revision = Number.MAX_SAFE_INTEGER + 1; },
+  "string acknowledged": (j, c) => { c.acknowledged = "2"; },
+  "negative acknowledged": (j, c) => { c.acknowledged = -1; },
+  "overflow acknowledged": (j, c) => { c.acknowledged = 3; },
+  "zero total": (j, c) => { c.total = 0; },
+  "fractional total": (j, c) => { c.total = 2.5; },
+  "false complete": (j, c) => { c.complete = false; },
+  "string complete": (j, c) => { c.complete = "true"; },
+  "bad snapshot": (j, c) => { c.snapshot = "broken"; },
+  "missing snapshot": (j, c) => { delete c.snapshot; },
+  "bad key": (j, c) => { j.captures = { broken: c }; },
+  "null receipt": (j) => { j.captures[Object.keys(j.captures)[0]] = null; },
+  "array captures": (j) => { j.captures = []; },
+  "wrong scope": (j) => { j.scope.projectId = "wrong"; },
+  "missing scope": (j) => { delete j.scope; },
+};
+for (const [name, corrupt] of Object.entries(corruptions)) {
+  for (const script of ["capture", "flush"]) {
+    test(`${script}: corrupt settlement ${name} remains HOLD before requests or release`, () => {
+      const f = fixture();
+      hook(f, "capture", "ack");
+      const root = path.join(f.dir, "state/writes");
+      const dir = path.join(root, fs.readdirSync(root)[0]);
+      const file = path.join(dir, "settled.json");
+      const journal = JSON.parse(fs.readFileSync(file, "utf8"));
+      corrupt(journal, Object.values(journal.captures)[0]);
+      fs.writeFileSync(file, JSON.stringify(journal));
+      assert.match(hook(f, script, "ack").stdout, /UNKNOWN|HOLD/);
+      assert.ok(fs.existsSync(path.join(dir, "intent")), "corruption cannot release HOLD");
+      hook(f, "capture", "ack"); hook(f, "flush", "ack");
+      assert.equal(requests(f).length, 1, "corruption cannot authorize another POST");
+    });
+  }
+}
+
 test("acknowledged receipts survive TTL, and changed turn snapshot cannot reuse an old acknowledgment", () => {
   const f = fixture();
   hook(f, "capture", "ack"); hook(f, "flush", "ack");

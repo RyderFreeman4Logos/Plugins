@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { PROMPT_KEY_MAX_CHARS, STATE_MAX_PROMPT_IDS, STATE_MAX_PROMPTS, STATE_TTL_DAYS } from "./constants.js";
+import { ADD_MAX_MESSAGES, PROMPT_KEY_MAX_CHARS, STATE_MAX_PROMPT_IDS, STATE_MAX_PROMPTS, STATE_TTL_DAYS } from "./constants.js";
 import { sanitizeId } from "./identity.js";
 
 const EMPTY = () => ({ sessionId: null, projectId: null, promptIds: [], warned: false, flushed: false, prompts: {} });
@@ -226,11 +226,24 @@ export function claimWrite(dataDir, scope, operation) {
   try { journal = JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  if (writeDigest(journal.scope) !== writeDigest(scope) || !isPlainObject(journal.captures)
+  if (!isPlainObject(journal) || writeDigest(journal.scope) !== writeDigest(scope) || !isPlainObject(journal.captures)
       || !Number.isSafeInteger(journal.revision) || journal.revision < 0
-      || !(journal.flushedRevision === null || Number.isSafeInteger(journal.flushedRevision))) {
+      || !(journal.flushedRevision === null || (Number.isSafeInteger(journal.flushedRevision)
+        && journal.flushedRevision >= 0 && journal.flushedRevision <= journal.revision))) {
     throw new Error("invalid write settlement; HOLD");
   }
+  let revisions = 0;
+  for (const [key, receipt] of Object.entries(journal.captures)) {
+    if (!/^[a-f0-9]{64}$/.test(key) || !isPlainObject(receipt) || typeof receipt.snapshot !== "string" || !/^[a-f0-9]{64}$/.test(receipt.snapshot)
+        || !Number.isSafeInteger(receipt.total) || receipt.total <= 0
+        || !Number.isSafeInteger(receipt.acknowledged) || receipt.acknowledged <= 0 || receipt.acknowledged > receipt.total
+        || receipt.complete !== (receipt.acknowledged === receipt.total)
+        || (!receipt.complete && receipt.acknowledged % ADD_MAX_MESSAGES !== 0)) {
+      throw new Error("invalid capture settlement; HOLD");
+    }
+    revisions += Math.ceil(receipt.acknowledged / ADD_MAX_MESSAGES);
+  }
+  if (revisions !== journal.revision) throw new Error("invalid settlement revision; HOLD");
   const claim = { dir, hold, file, journal };
   // Store only identifiers, counts and digests: no transcript payload or error body.
   durableJson(path.join(hold, "unknown.json"), { outcome: "UNKNOWN", scope, ...operation, revision: journal.revision });
@@ -245,11 +258,15 @@ export function settleWrite(claim) {
   syncDirectory(claim.dir);
 }
 
-/** Release only AFTER matching acknowledged state is durably settled. */
+/** Release only AFTER matching acknowledged state is durably settled.
+ * Fence all fallible writes while the (possibly empty) intent still blocks admission.
+ * Final rmdir is deliberately not synced: a crash may restore HOLD, never lose an
+ * acknowledgment. No fallible publication follows removal, so UNKNOWN retains HOLD.
+ */
 export function releaseWrite(claim) {
   fs.unlinkSync(path.join(claim.hold, "unknown.json"));
-  fs.rmdirSync(claim.hold);
   syncDirectory(claim.dir);
+  fs.rmdirSync(claim.hold);
 }
 
 function hasUnknownWrite(dataDir, sessionId) {

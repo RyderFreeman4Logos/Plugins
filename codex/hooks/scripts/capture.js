@@ -71,7 +71,7 @@ runHook("Stop", async (input, ctx) => {
       const data = await client.add(
         { session_id: sanitizeId(sessionId, "unknown"), app_id: identity.appId, project_id: identity.projectId, messages: batch }, signal,
       );
-      if (!["accumulated", "extracted", "no_extraction"].includes(data?.status) || data.message_count !== batch.length) {
+      if (!["accumulated", "extracted"].includes(data?.status) || data.message_count !== batch.length) {
         throw new Error("invalid add acknowledgment");
       }
       committed += batch.length;
