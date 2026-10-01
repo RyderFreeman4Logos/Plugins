@@ -23,6 +23,11 @@ export function deadline(ms) {
   return AbortSignal.timeout(ms);
 }
 
+/** Historical arbitrary endpoints are not current routing permission. */
+export function isCurrentScope(config, scope) {
+  return scope.baseUrl === config.baseUrl && scope.appId === APP_ID;
+}
+
 export function createClient({ baseUrl, fetchImpl = fetch }) {
   async function call(method, path, body, signal) {
     let res;
@@ -90,8 +95,7 @@ export function createClient({ baseUrl, fetchImpl = fetch }) {
  */
 export async function flushSession(config, scope, signal, idleMs = null) {
   try {
-    // Historical arbitrary endpoints are not current routing permission.
-    if (scope.baseUrl !== config.baseUrl || scope.appId !== APP_ID) return "UNKNOWN";
+    if (!isCurrentScope(config, scope)) return "UNKNOWN";
     const claim = claimWrite(config.dataDir, scope, { kind: "flush" });
     if (!claim) return "UNKNOWN";
     if (idleMs !== null && !scopeIdle(config.dataDir, scope, idleMs)) {

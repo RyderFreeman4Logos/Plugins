@@ -2,7 +2,7 @@
 import path from "node:path";
 import { runHook } from "./lib/hook-io.js";
 import { ensureEveros } from "./lib/provision.js";
-import { flushSession, deadline } from "./lib/everos.js";
+import { deadline, flushSession, isCurrentScope } from "./lib/everos.js";
 import { claimWarning, pendingFlushes, WRITE_HOLD } from "./lib/state.js";
 import { isLoopback } from "./lib/config.js";
 import { OVERLAP_NOTICE, claimOverlapNotice, nativeMemoryState } from "./lib/native-memory.js";
@@ -33,12 +33,13 @@ const SWEEP_MAX_SESSIONS = 5;
  */
 async function sweepAbandoned(config, debug) {
   const { scopes, held } = pendingFlushes(config.dataDir, ABANDONED_AFTER_MS);
-  const results = await Promise.all(scopes.slice(0, SWEEP_MAX_SESSIONS).map(async (scope) => {
+  const eligible = scopes.filter((scope) => isCurrentScope(config, scope));
+  const results = await Promise.all(eligible.slice(0, SWEEP_MAX_SESSIONS).map(async (scope) => {
     const outcome = await flushSession(config, scope, deadline(FLUSH_DISPATCH_MS), ABANDONED_AFTER_MS);
     debug(`abandoned flush ${outcome}`);
     return outcome;
   }));
-  return held || results.includes("UNKNOWN");
+  return held || eligible.length !== scopes.length || results.includes("UNKNOWN");
 }
 
 
