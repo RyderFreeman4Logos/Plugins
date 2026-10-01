@@ -105,9 +105,9 @@ export function rememberPrompt(dataDir, sessionId, turnId, prompt) {
 
 export function markStored(dataDir, sessionId, promptId, projectId = null) {
   const state = readState(dataDir, sessionId);
-  if (isStored(state, promptId)) return;
-  state.promptIds = [...state.promptIds, promptId].slice(-STATE_MAX_PROMPT_IDS);
-  // A new turn reopens the session: whatever was flushed before is now stale.
+  if (!isStored(state, promptId)) state.promptIds = [...state.promptIds, promptId].slice(-STATE_MAX_PROMPT_IDS);
+  // Every newly acknowledged scope is activity, even when another scope stored
+  // this turn already. Deduplicate the profile count, not the liveness update.
   writeState(dataDir, sessionId, {
     ...state,
     sessionId,

@@ -358,6 +358,20 @@ test("authority: live activity protects every session scope", () => {
   assert.equal(requests(f).length, 2);
 });
 
+test("authority: a newly acknowledged scope refreshes activity without recounting the turn", () => {
+  const f = fixture();
+  hook(f, "capture", "ack");
+  hook(f, "flush", "ack");
+  idle(f);
+  hook(f, "capture", "ack", { EVEROS_CODEX_PROJECT_ID: "other-project" });
+  hook(f, "session-start", "ack");
+  assert.equal(requests(f).length, 3, "fresh acknowledgment is not abandoned activity");
+  assert.deepEqual(readState(f.dir, "s1").promptIds, ["t1"], "profile projection stays deduplicated");
+  idle(f);
+  hook(f, "session-start", "ack");
+  assert.equal(requests(f).length, 4);
+});
+
 test("authority: under-claim liveness revalidation preserves pending work", async () => {
   const f = fixture();
   hook(f, "capture", "ack");
