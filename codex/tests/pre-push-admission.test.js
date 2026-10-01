@@ -70,6 +70,7 @@ function fixture(t) {
   runGit(repo, env, ["commit", "--quiet", "-m", "candidate"]);
   const format = runGit(repo, env, ["rev-parse", "--show-object-format"]);
   const identity = {
+    worktreeRoot: fs.realpathSync(repo),
     branch: runGit(repo, env, ["symbolic-ref", "--quiet", "HEAD"]),
     head: runGit(repo, env, ["rev-parse", "HEAD"]),
     tree: runGit(repo, env, ["rev-parse", "HEAD^{tree}"]),
@@ -90,6 +91,7 @@ function fixture(t) {
 function reportText(identity) {
   return [
     "Native whole-range review findings and evidence follow.",
+    `Worktree: ${identity.worktreeRoot}`,
     `Candidate: ${identity.head}`,
     `Tree: ${identity.tree}`,
     `Base: ${identity.baseRef} ${identity.base}`,
@@ -115,7 +117,7 @@ function syntheticEvidence(f) {
   fs.writeFileSync(f.gateLog, log, { mode: 0o600 });
   fs.writeFileSync(f.reviewReport, report, { mode: 0o600 });
   writeJson(f.gateReceipt, {
-    schema: 1, kind: "gate", status: "PASS", ...f.identity,
+    schema: 2, kind: "gate", status: "PASS", ...f.identity,
     command: { executable: "/tools/just", args: ["codex-full", "/tools/node20", "/tools/node22"] },
     node20: { path: "/tools/node20", version: node20 },
     node22: { path: "/tools/node22", version: node22 },
@@ -127,7 +129,7 @@ function syntheticEvidence(f) {
     log: { path: f.gateLog, sha256: sha(log) },
   });
   writeJson(f.reviewReceipt, {
-    schema: 1, kind: "review", source: "native", verdict: "PASS", scope: "complete-range",
+    schema: 2, kind: "review", source: "native", verdict: "PASS", scope: "complete-range",
     ...f.identity,
     report: { path: f.reviewReport, sha256: sha(report) },
   });
@@ -149,6 +151,31 @@ function remoteRef(f, ref) {
   assert.equal(result.status, 0, result.stderr);
   const line = result.stdout.trim().split(/\r?\n/).find((entry) => entry.endsWith(` ${ref}`));
   return line?.split(" ", 1)[0] ?? null;
+}
+
+for (const kind of ["gate", "review"]) {
+  test(`worktree: moved checkout rejects producing ${kind} receipt through installed hook`, (t) => {
+    const f = fixture(t);
+    const admittedEnv = syntheticEvidence(f);
+    assert.equal(verify(f).status, 0, "same-root control must admit");
+    assert.equal(run(lefthook, ["install"], { cwd: f.repo, env: f.env }).status, 0);
+    const moved = path.join(f.root, "moved");
+    fs.renameSync(f.repo, moved);
+    f.repo = moved;
+    f.script = path.join(moved, "codex/scripts/pre-push-admission.mjs");
+    // Isolate review binding: keep the gate at the new root, review at its producer.
+    if (kind === "review") {
+      const gate = receipt(f, "gateReceipt");
+      gate.worktreeRoot = fs.realpathSync(moved);
+      writeJson(f.gateReceipt, gate);
+    }
+    const result = verify(f);
+    assert.notEqual(result.status, 0, "moved worktree must not reuse old evidence");
+    assert.match(result.stderr, /worktreeRoot/);
+    const pushed = run("git", ["push", "origin", `${f.identity.branch}:${f.identity.branch}`], { cwd: f.repo, env: admittedEnv });
+    assert.notEqual(pushed.status, 0);
+    assert.equal(remoteRef(f, f.identity.branch), null, "rejected relocation cannot update refs");
+  });
 }
 
 test("resolved pre-push hook preserves stdin and invokes exact-candidate admission", (t) => {
@@ -193,9 +220,13 @@ test("receipt producers and direct verifier bind one clean exact candidate and f
   const gate = run(process.execPath, [f.script, "record-gate", fakeJust, fakeNode20, fakeNode22, f.gateLog, f.gateReceipt], { cwd: f.repo, env: f.env });
   assert.equal(gate.status, 0, gate.stderr || gate.stdout);
   assert.equal(receipt(f, "gateReceipt").testSummaries.node20.tests, 2);
+  assert.equal(receipt(f, "gateReceipt").schema, 2);
+  assert.equal(receipt(f, "gateReceipt").worktreeRoot, fs.realpathSync(f.repo));
   fs.writeFileSync(f.reviewReport, reportText(f.identity), { mode: 0o600 });
   const review = run(process.execPath, [f.script, "record-review", f.reviewReport, f.reviewReceipt], { cwd: f.repo, env: f.env });
   assert.equal(review.status, 0, review.stderr || review.stdout);
+  assert.equal(receipt(f, "reviewReceipt").schema, 2);
+  assert.equal(receipt(f, "reviewReceipt").worktreeRoot, fs.realpathSync(f.repo));
   const gateBefore = fs.readFileSync(f.gateReceipt);
   const reviewBefore = fs.readFileSync(f.reviewReceipt);
   const logBefore = fs.readFileSync(f.gateLog);
@@ -223,6 +254,12 @@ test("receipt producers and direct verifier bind one clean exact candidate and f
   }
 
   const gateCases = [
+    ["gate schema-1 with root", (r) => { r.schema = 1; }],
+    ["old gate schema", (r) => { r.schema = 1; delete r.worktreeRoot; }],
+    ["unknown gate schema", (r) => { r.schema = 3; }],
+    ["missing gate schema", (r) => { delete r.schema; }],
+    ["missing gate root", (r) => { delete r.worktreeRoot; }],
+    ["wrong gate root", (r) => { r.worktreeRoot = f.root; }],
     ["gate FAIL", (r) => { r.status = "FAIL"; }],
     ["stale gate HEAD", (r) => { r.head = f.identity.base; }],
     ["wrong gate tree", (r) => { r.tree = f.identity.base; }],
@@ -252,6 +289,12 @@ test("receipt producers and direct verifier bind one clean exact candidate and f
   fs.writeFileSync(f.reviewReport, reportBefore);
 
   const reviewCases = [
+    ["review schema-1 with root", (r) => { r.schema = 1; }],
+    ["old review schema", (r) => { r.schema = 1; delete r.worktreeRoot; }],
+    ["unknown review schema", (r) => { r.schema = 3; }],
+    ["missing review schema", (r) => { delete r.schema; }],
+    ["missing review root", (r) => { delete r.worktreeRoot; }],
+    ["wrong review root", (r) => { r.worktreeRoot = f.root; }],
     ["review FAIL", (r) => { r.verdict = "FAIL"; }],
     ["wrong review source", (r) => { r.source = "synthetic"; }],
     ["wrong review scope", (r) => { r.scope = "partial"; }],
@@ -277,6 +320,21 @@ test("receipt producers and direct verifier bind one clean exact candidate and f
   writeJson(f.reviewReceipt, staleVerdict);
   assert.notEqual(verify(f).status, 0, "a hash-matched non-PASS report unexpectedly passed");
   fs.writeFileSync(f.reviewReport, reportBefore);
+  for (const replacement of ["", `Worktree: ${f.root}`]) {
+    const badRootReport = Buffer.from(reportBefore.toString("utf8").replace(`Worktree: ${f.identity.worktreeRoot}`, replacement));
+    fs.writeFileSync(f.reviewReport, badRootReport);
+    const changed = JSON.parse(reviewBefore.toString("utf8"));
+    changed.report.sha256 = sha(badRootReport);
+    writeJson(f.reviewReceipt, changed);
+    assert.match(verify(f).stderr, /required attestation: Worktree:/);
+    const output = path.join(f.temp, "denied-review.json");
+    const denied = run(process.execPath, [f.script, "record-review", f.reviewReport, output], { cwd: f.repo, env: f.env });
+    assert.notEqual(denied.status, 0);
+    assert.match(denied.stderr, /required attestation: Worktree:/);
+    assert.ok(!fs.existsSync(output));
+  }
+  fs.writeFileSync(f.reviewReport, reportBefore);
+  fs.writeFileSync(f.reviewReceipt, reviewBefore);
 
   fs.writeFileSync(f.gateReceipt, "{\n");
   assert.notEqual(verify(f).status, 0, "malformed gate JSON unexpectedly passed");
@@ -301,25 +359,60 @@ test("receipt producers and direct verifier bind one clean exact candidate and f
   assert.equal(verify(f).status, 0, "restored exact candidate should pass");
 });
 
-test("installed hook blocks unreviewed transport, admits fixture receipts, rejects outgoing-ref mismatches", (t) => {
+test("worktree: physical-root alias admits external evidence and denies evidence inside checkout", (t) => {
   const f = fixture(t);
-  const install = run(lefthook, ["install"], { cwd: f.repo, env: f.env });
-  assert.equal(install.status, 0, install.stderr || install.stdout);
-  const feature = f.identity.branch;
-  const unreviewed = run("git", ["push", "origin", `${feature}:${feature}`], { cwd: f.repo, env: f.env });
-  assert.notEqual(unreviewed.status, 0, "unreviewed push unexpectedly passed");
-  assert.equal(remoteRef(f, feature), null, "rejected push updated the bare remote");
-
-  const admittedEnv = syntheticEvidence(f);
-  const admitted = run("git", ["push", "origin", `${feature}:${feature}`], { cwd: f.repo, env: admittedEnv });
+  const insideTemp = path.join(f.temp, "checkout");
+  fs.renameSync(f.repo, insideTemp);
+  f.repo = insideTemp;
+  f.script = path.join(insideTemp, "codex/scripts/pre-push-admission.mjs");
+  f.identity.worktreeRoot = fs.realpathSync(insideTemp);
+  const alias = path.join(f.root, "checkout-alias");
+  fs.symlinkSync(insideTemp, alias, "dir");
+  syntheticEvidence(f);
+  f.repo = alias;
+  f.script = path.join(alias, "codex/scripts/pre-push-admission.mjs");
+  assert.equal(verify(f).status, 0, "same physical root is one producing worktree");
+  assert.equal(run(lefthook, ["install"], { cwd: alias, env: f.env }).status, 0);
+  const admitted = run("git", ["push", "origin", `${f.identity.branch}:${f.identity.branch}`], { cwd: alias, env: { ...f.env, ...evidenceEnv(f) } });
   assert.equal(admitted.status, 0, admitted.stderr || admitted.stdout);
-  assert.equal(remoteRef(f, feature), f.identity.head, "admitted push did not update exact feature ref");
-
-  runGit(f.repo, f.env, ["branch", "fix/other", f.identity.head]);
-  const wrongLocal = run("git", ["push", "origin", "refs/heads/fix/other:refs/heads/fix/other"], { cwd: f.repo, env: admittedEnv });
-  assert.notEqual(wrongLocal.status, 0, "non-checked-out local ref unexpectedly passed");
-  assert.equal(remoteRef(f, "refs/heads/fix/other"), null, "wrong local ref updated the bare remote");
-  const wrongRemote = run("git", ["push", "origin", `${feature}:refs/heads/fix/other`], { cwd: f.repo, env: admittedEnv });
-  assert.notEqual(wrongRemote.status, 0, "mismatched remote ref unexpectedly passed");
-  assert.equal(remoteRef(f, "refs/heads/fix/other"), null, "wrong remote ref updated the bare remote");
+  assert.equal(remoteRef(f, f.identity.branch), f.identity.head);
+  assert.ok(fs.lstatSync(alias).isSymbolicLink());
+  assert.equal(fs.readlinkSync(alias), insideTemp, "configured symlink must remain intact");
+  const hidden = path.join(insideTemp, "base.txt");
+  assert.match(verify(f, update(f), { CODEX_GATE_RECEIPT: hidden }).stderr, /external file/);
+  const output = path.join(insideTemp, "forbidden.json");
+  const producer = run(process.execPath, [f.script, "record-review", f.reviewReport, output], { cwd: alias, env: f.env });
+  assert.notEqual(producer.status, 0);
+  assert.match(producer.stderr, /external to the checkout/);
+  assert.ok(!fs.existsSync(output));
+  const gateProducer = run(process.execPath, [f.script, "record-gate", process.execPath, process.execPath, process.execPath, output, path.join(f.temp, "denied-gate.json")], { cwd: alias, env: f.env });
+  assert.notEqual(gateProducer.status, 0);
+  assert.match(gateProducer.stderr, /external to the checkout/);
+  assert.ok(!fs.existsSync(output));
 });
+
+for (const existing of [false, true]) {
+  test(`installed hook blocks unreviewed transport and admits ${existing ? "existing-branch fast-forward" : "new branch"} fixture receipts`, (t) => {
+    const f = fixture(t);
+    if (existing) runGit(f.repo, f.env, ["--git-dir", f.origin, "update-ref", f.identity.branch, f.identity.base]);
+    const install = run(lefthook, ["install"], { cwd: f.repo, env: f.env });
+    assert.equal(install.status, 0, install.stderr || install.stdout);
+    const feature = f.identity.branch;
+    const unreviewed = run("git", ["push", "origin", `${feature}:${feature}`], { cwd: f.repo, env: f.env });
+    assert.notEqual(unreviewed.status, 0, "unreviewed push unexpectedly passed");
+    assert.equal(remoteRef(f, feature), existing ? f.identity.base : null, "rejected push updated the bare remote");
+
+    const admittedEnv = syntheticEvidence(f);
+    const admitted = run("git", ["push", "origin", `${feature}:${feature}`], { cwd: f.repo, env: admittedEnv });
+    assert.equal(admitted.status, 0, admitted.stderr || admitted.stdout);
+    assert.equal(remoteRef(f, feature), f.identity.head, "admitted push did not update exact feature ref");
+
+    runGit(f.repo, f.env, ["branch", "fix/other", f.identity.head]);
+    const wrongLocal = run("git", ["push", "origin", "refs/heads/fix/other:refs/heads/fix/other"], { cwd: f.repo, env: admittedEnv });
+    assert.notEqual(wrongLocal.status, 0, "non-checked-out local ref unexpectedly passed");
+    assert.equal(remoteRef(f, "refs/heads/fix/other"), null, "wrong local ref updated the bare remote");
+    const wrongRemote = run("git", ["push", "origin", `${feature}:refs/heads/fix/other`], { cwd: f.repo, env: admittedEnv });
+    assert.notEqual(wrongRemote.status, 0, "mismatched remote ref unexpectedly passed");
+    assert.equal(remoteRef(f, "refs/heads/fix/other"), null, "wrong remote ref updated the bare remote");
+  });
+}

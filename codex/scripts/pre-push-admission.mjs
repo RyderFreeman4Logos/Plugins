@@ -53,10 +53,11 @@ function snapshot() {
   const oid = new RegExp(`^[0-9a-f]{${oidLength}}$`);
   if (![head, tree, base].every((value) => oid.test(value))) reject("Git returned a malformed object ID");
   if (head === base || tryGit(["merge-base", "--is-ancestor", base, head], root) === null) reject("HEAD must be a nonempty descendant of the declared base");
-  return { root, branch, head, tree, base, oidLength };
+  return { root, worktreeRoot: fs.realpathSync(root), branch, head, tree, base, oidLength };
 }
 function identity(candidate) {
   return {
+    worktreeRoot: candidate.worktreeRoot,
     branch: candidate.branch,
     head: candidate.head,
     tree: candidate.tree,
@@ -66,7 +67,7 @@ function identity(candidate) {
   };
 }
 function sameCandidate(before, after) {
-  for (const key of ["root", "branch", "head", "tree", "base"]) {
+  for (const key of ["worktreeRoot", "branch", "head", "tree", "base"]) {
     if (before[key] !== after[key]) reject(`candidate changed during admission: ${key}`);
   }
 }
@@ -91,13 +92,13 @@ function canonicalExisting(file, candidate) {
   const stat = fs.lstatSync(file);
   if (stat.isSymbolicLink() || !stat.isFile()) reject("evidence must be a regular, non-symlink file");
   const real = fs.realpathSync(file);
-  if (real !== file || isWithin(candidate.root, real) || !isWithin(tempRoot(), real) || (typeof process.getuid === "function" && stat.uid !== process.getuid()) || (stat.mode & 0o022) !== 0) reject("evidence must be an owned, non-writable external file under HOME/tmp");
+  if (real !== file || isWithin(candidate.worktreeRoot, real) || !isWithin(tempRoot(), real) || (typeof process.getuid === "function" && stat.uid !== process.getuid()) || (stat.mode & 0o022) !== 0) reject("evidence must be an owned, non-writable external file under HOME/tmp");
   return fs.readFileSync(real);
 }
 function newEvidencePath(file, candidate) {
   if (typeof file !== "string" || !path.isAbsolute(file) || path.resolve(file) !== file) reject("output path must be canonical and absolute");
   const parent = path.dirname(file);
-  if (fs.realpathSync(parent) !== parent || isWithin(candidate.root, file) || !isWithin(tempRoot(), file)) reject("output must be external to the checkout under HOME/tmp");
+  if (fs.realpathSync(parent) !== parent || isWithin(candidate.worktreeRoot, file) || !isWithin(tempRoot(), file)) reject("output must be external to the checkout under HOME/tmp");
   try { fs.lstatSync(file); reject(`output already exists: ${file}`); } catch (error) { if (error.code !== "ENOENT") throw error; }
   return file;
 }
@@ -154,8 +155,8 @@ function checkReviewReport(report, candidate) {
 }
 function checkGate(candidate) {
   const receipt = readReceipt("CODEX_GATE_RECEIPT", candidate);
-  exactKeys(receipt, ["schema", "kind", "status", "branch", "head", "tree", "baseRef", "base", "range", "command", "node20", "node22", "testSummaries", "exitCode", "log"], "gate receipt");
-  if (receipt.schema !== 1 || receipt.kind !== "gate" || receipt.status !== "PASS" || receipt.exitCode !== 0) reject("gate receipt is not a successful schema-1 full gate");
+  exactKeys(receipt, ["schema", "kind", "status", "worktreeRoot", "branch", "head", "tree", "baseRef", "base", "range", "command", "node20", "node22", "testSummaries", "exitCode", "log"], "gate receipt");
+  if (receipt.schema !== 2 || receipt.kind !== "gate" || receipt.status !== "PASS" || receipt.exitCode !== 0) reject("gate receipt is not a successful schema-2 full gate");
   checkIdentity(receipt, candidate);
   exactKeys(receipt.command, ["executable", "args"], "gate command");
   if (typeof receipt.command.executable !== "string" || !path.isAbsolute(receipt.command.executable) || path.basename(receipt.command.executable) !== "just" || JSON.stringify(receipt.command.args) !== JSON.stringify(["codex-full", receipt.node20?.path, receipt.node22?.path])) reject("gate command is not the declared Node 20/22 codex-full matrix");
@@ -173,6 +174,7 @@ function checkGate(candidate) {
 function expectedReviewLines(candidate) {
   const facts = identity(candidate);
   return [
+    `Worktree: ${facts.worktreeRoot}`,
     `Candidate: ${facts.head}`,
     `Tree: ${facts.tree}`,
     `Base: ${facts.baseRef} ${facts.base}`,
@@ -183,8 +185,8 @@ function expectedReviewLines(candidate) {
 }
 function checkReview(candidate) {
   const receipt = readReceipt("CODEX_REVIEW_RECEIPT", candidate);
-  exactKeys(receipt, ["schema", "kind", "source", "verdict", "scope", "branch", "head", "tree", "baseRef", "base", "range", "report"], "review receipt");
-  if (receipt.schema !== 1 || receipt.kind !== "review" || receipt.source !== "native" || receipt.verdict !== "PASS" || receipt.scope !== SCOPE) reject("review receipt is not a native complete-range PASS");
+  exactKeys(receipt, ["schema", "kind", "source", "verdict", "scope", "worktreeRoot", "branch", "head", "tree", "baseRef", "base", "range", "report"], "review receipt");
+  if (receipt.schema !== 2 || receipt.kind !== "review" || receipt.source !== "native" || receipt.verdict !== "PASS" || receipt.scope !== SCOPE) reject("review receipt is not a schema-2 native complete-range PASS");
   checkIdentity(receipt, candidate);
   checkReviewReport(checkHashEvidence(receipt.report, "review report", candidate).toString("utf8"), candidate);
 }
@@ -262,7 +264,7 @@ function runGate(args) {
   const summaries = testSummaries(log);
   sameCandidate(candidate, snapshot());
   const receipt = {
-    schema: 1, kind: "gate", status: "PASS", ...identity(candidate),
+    schema: 2, kind: "gate", status: "PASS", ...identity(candidate),
     command: { executable: just, args: ["codex-full", node20, node22] },
     node20: { path: node20, version: NODE20 },
     node22: { path: node22, version: NODE22 },
@@ -282,7 +284,7 @@ function runReview(args) {
   checkReviewReport(reportBytes.toString("utf8"), candidate);
   sameCandidate(candidate, snapshot());
   writeReceipt(receiptPath, {
-    schema: 1, kind: "review", source: "native", verdict: "PASS", scope: SCOPE,
+    schema: 2, kind: "review", source: "native", verdict: "PASS", scope: SCOPE,
     ...identity(candidate), report: { path: reportPath, sha256: digest(reportBytes) },
   });
   console.log(`PASS review receipt: ${receiptPath}`);

@@ -123,7 +123,7 @@ ID="plugins-$HEAD"
 node codex/scripts/pre-push-admission.mjs record-gate "$(command -v just)" "$NODE20" "$NODE22" "$TMPROOT/$ID-full.log" "$TMPROOT/$ID-gate.json"
 ```
 
-After an independent full-range native review, preserve its complete report under `TMPROOT` and ensure it contains the exact Candidate, Tree, Base, Range, Scope, and final `VERDICT: PASS` lines used by the admission receipt. Then record and select both receipts:
+After an independent full-range native review, preserve its complete report under `TMPROOT` and ensure it contains the exact Worktree (`realpath` of the producing checkout), Candidate, Tree, Base, Range, Scope, and final `VERDICT: PASS` lines used by the schema-2 admission receipts. Moving the checkout invalidates both receipts; a directory symlink to the same physical checkout does not. Then record and select both receipts:
 
 ```sh
 node codex/scripts/pre-push-admission.mjs record-review "$TMPROOT/$ID-review.md" "$TMPROOT/$ID-review.json"
