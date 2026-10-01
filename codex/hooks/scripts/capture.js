@@ -62,7 +62,7 @@ runHook("Stop", async (input, ctx) => {
     if (!claim) return WRITE_HOLD;
     if (claim.journal.captures[key]) {
       const prior = claim.journal.captures[key];
-      if (prior.complete !== true || prior.snapshot !== snapshot) return WRITE_HOLD;
+      if (prior.snapshot !== snapshot) return WRITE_HOLD;
       releaseWrite(claim);
       return undefined;
     }

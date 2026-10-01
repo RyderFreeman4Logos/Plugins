@@ -131,25 +131,43 @@ export function markFlushed(dataDir, sessionId) {
  * eligible, so a session running in another window is never sealed underneath it.
  */
 export function pendingFlushes(dataDir, idleMs) {
-  const dir = stateDir(dataDir);
-  const cutoff = Date.now() - idleMs;
-  const pending = [];
+  const root = path.join(stateDir(dataDir), "writes");
+  const result = { scopes: [], held: false };
   let names;
-  try { names = fs.readdirSync(dir); } catch { return pending; }
+  try { names = fs.readdirSync(root); } catch (error) { result.held = error.code !== "ENOENT"; return result; }
   for (const name of names) {
-    if (!name.endsWith(".json")) continue;
-    const file = path.join(dir, name);
+    const file = path.join(root, name, "settled.json");
+    let scope;
     try {
-      // mtimeMs carries sub-millisecond precision and can read as marginally
-      // ahead of Date.now(), which would make a just-written file look like the
-      // future. Floor it so idleMs = 0 means "no idle requirement".
-      if (Math.floor(fs.statSync(file).mtimeMs) > cutoff) continue;
-      const state = parseState(JSON.parse(fs.readFileSync(file, "utf8")));
-      if (state.flushed || state.promptIds.length === 0 || hasUnknownWrite(dataDir, state.sessionId)) continue;
-      if (state.sessionId) pending.push({ sessionId: state.sessionId, projectId: state.projectId });
-    } catch { /* unreadable or racing; skip */ }
+      scope = JSON.parse(fs.readFileSync(file, "utf8")).scope;
+      if (!validScope(scope) || writeDigest(scope) !== name) throw new Error("unidentifiable scope");
+    } catch {
+      // ponytail: unidentifiable authority blocks this bounded sweep, not direct
+      // independent writers. No cache can reconstruct its producing partition.
+      return { scopes: [], held: true };
+    }
+    if (fs.existsSync(path.join(root, name, "intent"))) { result.held = true; continue; }
+    try {
+      const journal = readSettlement(file, scope);
+      if (journal.revision > 0 && journal.flushedRevision !== journal.revision && scopeIdle(dataDir, scope, idleMs)) result.scopes.push(scope);
+    } catch {
+      // Re-enter the same exclusive claim boundary to park identifiable corruption.
+      result.scopes.push(scope);
+    }
   }
-  return pending;
+  return result;
+}
+
+/** Cache mtime is activity only; absent cache falls back to the durable receipt.
+ * Rechecked under the exclusive claim before an abandoned flush may send.
+ */
+export function scopeIdle(dataDir, scope, idleMs) {
+  let mtime;
+  try { mtime = fs.statSync(statePath(dataDir, scope.sessionId)).mtimeMs; } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    mtime = fs.statSync(path.join(stateDir(dataDir), "writes", writeDigest(scope), "settled.json")).mtimeMs;
+  }
+  return Math.floor(mtime) <= Date.now() - idleMs;
 }
 
 /** True at most once per session: the caller may print an "EverOS is down" line. */
@@ -203,30 +221,15 @@ function durableJson(file, value) {
   syncDirectory(path.dirname(file));
 }
 
-/** Partition-bound journal, separate from the best-effort prompt/liveness cache.
- * An exclusive intent directory is NEVER recovered by age or process liveness.
- * Even an empty directory (crash before intent write) means UNKNOWN. Settled
- * receipts are retained, so TTL pruning cannot make an acknowledged turn new.
- * ponytail: one writer per partition/session; no automatic recovery protocol.
- */
-export function claimWrite(dataDir, scope, operation) {
-  const dir = path.join(stateDir(dataDir), "writes", writeDigest(scope));
-  const hold = path.join(dir, "intent");
-  durableDirectory(dir);
-  // The best-effort cache may have created state/dataDir earlier without syncing.
-  syncDirectory(dataDir);
-  syncDirectory(path.dirname(dataDir));
-  try { fs.mkdirSync(hold, { mode: 0o700 }); } catch (error) {
-    if (error.code === "EEXIST") return null;
-    throw error;
-  }
-  syncDirectory(dir);
-  const file = path.join(dir, "settled.json");
-  let journal = { scope, captures: {}, revision: 0, flushedRevision: null };
-  try { journal = JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  if (!isPlainObject(journal) || writeDigest(journal.scope) !== writeDigest(scope) || !isPlainObject(journal.captures)
+function validScope(scope) {
+  return isPlainObject(scope) && ["baseUrl", "appId", "projectId", "sessionId"].every((key) => typeof scope[key] === "string" && scope[key].length > 0)
+    && Object.keys(scope).length === 4;
+}
+
+/** The one admission validator for capture, direct flush and sweep selection. */
+function readSettlement(file, scope) {
+  const journal = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!validScope(scope) || !isPlainObject(journal) || writeDigest(journal.scope) !== writeDigest(scope) || !isPlainObject(journal.captures)
       || !Number.isSafeInteger(journal.revision) || journal.revision < 0
       || !(journal.flushedRevision === null || (Number.isSafeInteger(journal.flushedRevision)
         && journal.flushedRevision >= 0 && journal.flushedRevision <= journal.revision))) {
@@ -242,8 +245,41 @@ export function claimWrite(dataDir, scope, operation) {
       throw new Error("invalid capture settlement; HOLD");
     }
     revisions += Math.ceil(receipt.acknowledged / ADD_MAX_MESSAGES);
+    if (!receipt.complete) throw new Error("incomplete capture settlement; HOLD");
   }
   if (revisions !== journal.revision) throw new Error("invalid settlement revision; HOLD");
+  return journal;
+}
+
+/** Partition-bound journal, separate from the best-effort prompt/liveness cache.
+ * An exclusive intent directory is NEVER recovered by age or process liveness.
+ * Even an empty directory (crash before intent write) means UNKNOWN. Settled
+ * receipts are retained, so TTL pruning cannot make an acknowledged turn new.
+ * ponytail: one writer per partition/session; no automatic recovery protocol.
+ */
+export function claimWrite(dataDir, scope, operation) {
+  if (!validScope(scope)) throw new Error("invalid write scope; HOLD");
+  const dir = path.join(stateDir(dataDir), "writes", writeDigest(scope));
+  const hold = path.join(dir, "intent");
+  durableDirectory(path.dirname(dir));
+  // Only our successful exclusive mkdir proves first use. A surviving directory
+  // with missing authority is never initialized again (including a setup crash).
+  let created = false;
+  try { fs.mkdirSync(dir, { mode: 0o700 }); created = true; } catch (error) { if (error.code !== "EEXIST") throw error; }
+  syncDirectory(path.dirname(dir));
+  syncDirectory(dataDir);
+  syncDirectory(path.dirname(dataDir));
+  const file = path.join(dir, "settled.json");
+  // A missing receipt is itself HOLD. Do not steal the initializer's intent
+  // between its exclusive scope mkdir and publication of empty authority.
+  if (!created && !fs.existsSync(file)) return null;
+  try { fs.mkdirSync(hold, { mode: 0o700 }); } catch (error) {
+    if (error.code === "EEXIST") return null;
+    throw error;
+  }
+  syncDirectory(dir);
+  if (created) durableJson(file, { scope, captures: {}, revision: 0, flushedRevision: null });
+  const journal = readSettlement(file, scope);
   const claim = { dir, hold, file, journal };
   // Store only identifiers, counts and digests: no transcript payload or error body.
   durableJson(path.join(hold, "unknown.json"), { outcome: "UNKNOWN", scope, ...operation, revision: journal.revision });

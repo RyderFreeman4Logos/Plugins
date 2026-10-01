@@ -1,7 +1,7 @@
 // Synthetic IO boundaries only; actual hook/client/state modules are untouched.
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 // Never allow provisioning to escape a failed test health mock.
 const childProcess = await import("node:child_process");
@@ -12,12 +12,14 @@ childProcess.default.spawn = (...args) => {
 const mode = process.env.WRITE_MODE;
 let acknowledged = false;
 let renamedSettlement = false;
-for (const name of ["fsyncSync", "renameSync", "writeFileSync"]) {
+for (const name of ["fsyncSync", "renameSync", "writeFileSync", "mkdirSync", "rmdirSync"]) {
   const original = fs[name];
   fs[name] = (...args) => {
+    if (!acknowledged && mode === `bootstrap-${name}` && typeof args[0] === "number"
+        && fs.readlinkSync(`/proc/self/fd/${args[0]}`).endsWith("/settled.json")) throw new Error("synthetic bootstrap fault");
     if (name === "fsyncSync" && fs.fstatSync(args[0]).isDirectory()) {
       const directory = fs.readlinkSync(`/proc/self/fd/${args[0]}`);
-      if (mode === "release-directory-fsync" && fs.existsSync(`${directory}/settled.json`) && !fs.existsSync(`${directory}/intent/unknown.json`)) {
+      if (acknowledged && mode === "release-directory-fsync" && fs.existsSync(`${directory}/settled.json`) && !fs.existsSync(`${directory}/intent/unknown.json`)) {
         fs.appendFileSync(process.env.WRITE_REQUESTS + ".fault", "release\n");
         throw new Error("synthetic release directory sync fault");
       }
@@ -32,6 +34,14 @@ for (const name of ["fsyncSync", "renameSync", "writeFileSync"]) {
       throw Object.assign(new Error("synthetic persistence fault"), { code: "EIO" });
     }
     const result = original(...args);
+    if (name === "mkdirSync" && mode === "scope-mkdir-contender" && /\/writes\/[a-f0-9]{64}$/.test(args[0])) {
+      const contender = spawnSync(process.execPath, ["--import", import.meta.filename, process.argv[1]], {
+        env: { ...process.env, WRITE_MODE: "ack" }, input: process.env.WRITE_CONTENDER_INPUT, encoding: "utf8", timeout: 10000,
+      });
+      if (contender.status !== 0 || !/UNKNOWN|HOLD/.test(contender.stdout)) throw new Error("initializer contender did not park");
+    }
+    if ((name === "mkdirSync" && mode === "scope-mkdir-crash" && /\/writes\/[a-f0-9]{64}$/.test(args[0]))
+        || (name === "rmdirSync" && mode === "cache-after-release-crash" && String(args[0]).endsWith("/intent"))) process.exit(0);
     if (name === "renameSync" && String(args[1]).endsWith("/settled.json")) renamedSettlement = true;
     return result;
   };

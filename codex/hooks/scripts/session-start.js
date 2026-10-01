@@ -2,7 +2,6 @@
 import path from "node:path";
 import { runHook } from "./lib/hook-io.js";
 import { ensureEveros } from "./lib/provision.js";
-import { resolveIdentity } from "./lib/identity.js";
 import { flushSession, deadline } from "./lib/everos.js";
 import { claimWarning, pendingFlushes, WRITE_HOLD } from "./lib/state.js";
 import { isLoopback } from "./lib/config.js";
@@ -32,16 +31,14 @@ const SWEEP_MAX_SESSIONS = 5;
  * sit in the buffer and are never extracted. Nobody is waiting on this hook, so
  * it is the right place to clean up after the previous session.
  */
-async function sweepAbandoned(config, cwd, debug) {
-  const abandoned = pendingFlushes(config.dataDir, ABANDONED_AFTER_MS).slice(0, SWEEP_MAX_SESSIONS);
-  if (abandoned.length === 0) return;
-  const identity = resolveIdentity(cwd, config);
-  const results = await Promise.all(abandoned.map(async ({ sessionId, projectId }) => {
-    const outcome = await flushSession(config, { ...identity, projectId: projectId ?? identity.projectId }, sessionId, deadline(FLUSH_DISPATCH_MS));
+async function sweepAbandoned(config, debug) {
+  const { scopes, held } = pendingFlushes(config.dataDir, ABANDONED_AFTER_MS);
+  const results = await Promise.all(scopes.slice(0, SWEEP_MAX_SESSIONS).map(async (scope) => {
+    const outcome = await flushSession(config, scope, deadline(FLUSH_DISPATCH_MS), ABANDONED_AFTER_MS);
     debug(`abandoned flush ${outcome}`);
     return outcome;
   }));
-  return results.includes("UNKNOWN");
+  return held || results.includes("UNKNOWN");
 }
 
 
@@ -63,7 +60,7 @@ runHook("SessionStart", async (input, ctx) => {
   const warnOnce = (message) => (claimWarning(config.dataDir, sessionId) ? { systemMessage: message } : undefined);
 
   if (outcome.status === "healthy" || outcome.status === "started") {
-    if (await sweepAbandoned(config, input.cwd ?? process.cwd(), debug)) return WRITE_HOLD;
+    if (await sweepAbandoned(config, debug)) return WRITE_HOLD;
   }
 
   switch (outcome.status) {

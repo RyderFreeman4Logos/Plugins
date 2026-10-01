@@ -1,4 +1,5 @@
-import { claimWrite, settleWrite, releaseWrite, writeScope, markFlushed } from "./state.js";
+import { claimWrite, settleWrite, releaseWrite, scopeIdle, markFlushed } from "./state.js";
+import { APP_ID } from "./constants.js";
 
 /**
  * Minimal client for the EverOS v2 memory API. Native fetch, no dependencies.
@@ -87,11 +88,16 @@ export function createClient({ baseUrl, fetchImpl = fetch }) {
 /** Both direct lifecycle hooks and abandoned sweeps use the same exclusive hold.
  * Only a recognized acknowledgment AND durable local settlement permit release.
  */
-export async function flushSession(config, identity, sessionId, signal) {
+export async function flushSession(config, scope, signal, idleMs = null) {
   try {
-    const scope = writeScope(config, identity, sessionId);
+    // Historical arbitrary endpoints are not current routing permission.
+    if (scope.baseUrl !== config.baseUrl || scope.appId !== APP_ID) return "UNKNOWN";
     const claim = claimWrite(config.dataDir, scope, { kind: "flush" });
     if (!claim) return "UNKNOWN";
+    if (idleMs !== null && !scopeIdle(config.dataDir, scope, idleMs)) {
+      releaseWrite(claim);
+      return "live";
+    }
     if (claim.journal.flushedRevision !== claim.journal.revision) {
       const data = await createClient({ baseUrl: scope.baseUrl }).flush(
         { session_id: scope.sessionId, app_id: scope.appId, project_id: scope.projectId }, signal,
@@ -101,7 +107,7 @@ export async function flushSession(config, identity, sessionId, signal) {
       settleWrite(claim);
     }
     releaseWrite(claim);
-    markFlushed(config.dataDir, sessionId);
+    markFlushed(config.dataDir, scope.sessionId);
     return "acknowledged";
   } catch {
     return "UNKNOWN";

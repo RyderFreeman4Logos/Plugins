@@ -5,9 +5,9 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { markStored, readState, rememberPrompt, statePath, pruneState } from "../hooks/scripts/lib/state.js";
+import { markStored, readState, rememberPrompt, statePath, pruneState, pendingFlushes, touchSession, writeDigest } from "../hooks/scripts/lib/state.js";
 import { ADD_MAX_MESSAGES } from "../hooks/scripts/lib/constants.js";
-import { createClient } from "../hooks/scripts/lib/everos.js";
+import { createClient, flushSession } from "../hooks/scripts/lib/everos.js";
 
 test("search keeps its existing read-only envelope compatibility", async () => {
   const expected = { episodes: [] };
@@ -255,6 +255,180 @@ for (const [name, corrupt] of Object.entries(corruptions)) {
     });
   }
 }
+
+function settlements(f) {
+  const root = path.join(f.dir, "state/writes");
+  return fs.readdirSync(root).map((name) => path.join(root, name, "settled.json"));
+}
+function idle(f, days = 1) {
+  const age = new Date(Date.now() - days * 86400000);
+  for (const file of [statePath(f.dir, "s1"), ...settlements(f)]) {
+    if (fs.existsSync(file)) fs.utimesSync(file, age, age);
+  }
+}
+for (const script of ["capture", "flush", "session-start"]) {
+  test(`authority: ${script} refuses lost settlement in an existing scope`, () => {
+    const f = fixture();
+    hook(f, "capture", "ack");
+    idle(f);
+    fs.unlinkSync(settlements(f)[0]);
+    assert.match(hook(f, script, "ack").stdout, /UNKNOWN|HOLD/);
+    assert.equal(requests(f).length, 1, "lost authority cannot authorize a POST");
+    assert.ok(!fs.existsSync(settlements(f)[0]), "missing authority is never recreated");
+  });
+}
+for (const distinctTurn of [false, true]) {
+  test(`authority: flush A then recover B (${distinctTurn ? "distinct" : "same"} turn)`, () => {
+    const f = fixture();
+    const other = { EVEROS_CODEX_PROJECT_ID: "other-project" };
+    hook(f, "capture", "ack");
+    hook(f, "flush", "ack");
+    if (distinctTurn) {
+      fs.writeFileSync(f.transcript, fs.readFileSync(f.transcript, "utf8").replaceAll('"t1"', '"t2"'));
+    }
+    hook(f, "capture", "ack", other, { turn_id: distinctTurn ? "t2" : "t1" });
+    // Flushing A again must not mask B's durable outstanding revision.
+    hook(f, "flush", "ack");
+    idle(f);
+    hook(f, "session-start", "ack");
+    hook(f, "session-start", "ack");
+    assert.equal(requests(f).length, 4);
+    assert.equal(requests(f).at(-1).body.project_id, "other-project");
+  });
+}
+for (const loss of ["missing", "ttl", "stale"]) {
+  test(`authority: pending capture survives ${loss} cache projection`, () => {
+    const f = fixture();
+    hook(f, "capture", "ack");
+    if (loss === "stale") {
+      const cache = readState(f.dir, "s1");
+      fs.writeFileSync(statePath(f.dir, "s1"), JSON.stringify({ ...cache, flushed: true, projectId: "wrong", promptIds: [] }));
+    }
+    idle(f, 31);
+    if (loss === "missing") fs.unlinkSync(statePath(f.dir, "s1"));
+    if (loss === "ttl") pruneState(f.dir);
+    hook(f, "session-start", "ack");
+    assert.equal(requests(f).length, 2);
+    assert.equal(requests(f).at(-1).body.project_id, "synthetic-project");
+  });
+}
+for (const sameSession of [true, false]) {
+  test(`authority: scoped HOLD does not mask healthy ${sameSession ? "same" : "other"} session`, () => {
+    const f = fixture();
+    hook(f, "capture", "accepted-lost");
+    hook(f, "capture", "ack", { EVEROS_CODEX_PROJECT_ID: "other-project" }, { session_id: sameSession ? "s1" : "s2" });
+    idle(f);
+    if (!sameSession) {
+      const age = new Date(Date.now() - 86400000);
+      fs.utimesSync(statePath(f.dir, "s2"), age, age);
+    }
+    hook(f, "session-start", "ack");
+    assert.equal(requests(f).length, 3);
+    assert.equal(requests(f).at(-1).body.project_id, "other-project");
+  });
+}
+test("authority: sweep never relabels historical endpoint or app", () => {
+  const f = fixture();
+  const remote = { EVEROS_CODEX_BASE_URL: "http://synthetic.invalid" };
+  hook(f, "capture", "ack", remote);
+  idle(f);
+  assert.match(hook(f, "session-start", "ack").stdout, /UNKNOWN|HOLD/);
+  assert.equal(requests(f).length, 1);
+  hook(f, "session-start", "ack", remote);
+  assert.equal(requests(f).length, 2, "compatible route can recover its own scope");
+});
+for (const script of ["capture", "flush", "session-start"]) {
+  test(`authority: ${script} refuses incomplete prefix without intent`, () => {
+    const f = fixture(ADD_MAX_MESSAGES + 2);
+    hook(f, "capture", "partial");
+    fs.rmSync(path.join(path.dirname(settlements(f)[0]), "intent"), { recursive: true });
+    idle(f);
+    assert.match(hook(f, script, "ack").stdout, /UNKNOWN|HOLD/);
+    assert.equal(requests(f).length, 2, "prefix cannot authorize capture or flush");
+    assert.ok(fs.existsSync(path.join(path.dirname(settlements(f)[0]), "intent")));
+  });
+}
+test("authority: live activity protects every session scope", () => {
+  const f = fixture();
+  hook(f, "capture", "ack");
+  hook(f, "capture", "ack", { EVEROS_CODEX_PROJECT_ID: "other-project" });
+  idle(f);
+  hook(f, "recall", "ack", {}, { prompt: "ok" });
+  hook(f, "session-start", "ack");
+  assert.equal(requests(f).length, 2);
+});
+
+test("authority: under-claim liveness revalidation preserves pending work", async () => {
+  const f = fixture();
+  hook(f, "capture", "ack");
+  idle(f);
+  const [scope] = pendingFlushes(f.dir, 30 * 60 * 1000).scopes;
+  assert.ok(scope);
+  touchSession(f.dir, "s1");
+  const fetchBefore = globalThis.fetch;
+  globalThis.fetch = () => { assert.fail("live scope cannot POST"); };
+  try {
+    assert.equal(await flushSession({ dataDir: f.dir, baseUrl: scope.baseUrl }, scope, undefined, 30 * 60 * 1000), "live");
+  } finally { globalThis.fetch = fetchBefore; }
+  assert.equal(JSON.parse(fs.readFileSync(settlements(f)[0])).flushedRevision, null);
+  idle(f);
+  hook(f, "session-start", "ack");
+  assert.equal(requests(f).length, 2);
+});
+test("authority: historical app is excluded rather than relabeled", () => {
+  const f = fixture();
+  hook(f, "capture", "ack");
+  const file = settlements(f)[0];
+  const journal = JSON.parse(fs.readFileSync(file));
+  journal.scope.appId = "historical-app";
+  const dir = path.join(path.dirname(path.dirname(file)), writeDigest(journal.scope));
+  fs.renameSync(path.dirname(file), dir);
+  fs.writeFileSync(path.join(dir, "settled.json"), JSON.stringify(journal));
+  idle(f);
+  assert.match(hook(f, "session-start", "ack").stdout, /UNKNOWN|HOLD/);
+  assert.equal(requests(f).length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "settled.json"))).flushedRevision, null);
+});
+test("authority: unidentifiable corrupt records block sweep but not independent direct scopes", () => {
+  const f = fixture();
+  hook(f, "capture", "ack");
+  fs.writeFileSync(settlements(f)[0], "{");
+  hook(f, "capture", "ack", { EVEROS_CODEX_PROJECT_ID: "other-project" });
+  idle(f);
+  assert.match(hook(f, "session-start", "ack").stdout, /UNKNOWN|HOLD/);
+  assert.equal(requests(f).length, 2);
+  hook(f, "flush", "ack", { EVEROS_CODEX_PROJECT_ID: "other-project" });
+  assert.equal(requests(f).length, 3);
+});
+for (const script of ["capture", "flush"]) {
+  test(`authority: ${script} initializer retains ownership against an interleaved contender`, () => {
+    const f = fixture();
+    hook(f, script, "scope-mkdir-contender", { WRITE_CONTENDER_INPUT: args(f, script).input });
+    assert.equal(requests(f).length, 1);
+    assert.ok(!fs.existsSync(path.join(path.dirname(settlements(f)[0]), "intent")));
+    hook(f, script, "ack");
+    assert.equal(requests(f).length, 1);
+  });
+  for (const mode of ["scope-mkdir-crash", "bootstrap-writeFileSync", "bootstrap-fsyncSync"]) {
+    test(`authority: ${script} ${mode} parks before send and after restart`, () => {
+      const f = fixture();
+      hook(f, script, mode);
+      hook(f, script, "ack");
+      assert.equal(requests(f).length, 0);
+      assert.match(hook(f, script, "ack").stdout, /UNKNOWN|HOLD/);
+    });
+  }
+}
+test("authority: release-to-cache crash retains discoverable acknowledged work", () => {
+  const f = fixture();
+  hook(f, "capture", "cache-after-release-crash");
+  assert.equal(requests(f).length, 1);
+  assert.ok(!fs.existsSync(path.join(path.dirname(settlements(f)[0]), "intent")));
+  assert.ok(!readState(f.dir, "s1").promptIds.includes("t1"));
+  idle(f);
+  hook(f, "session-start", "ack");
+  assert.equal(requests(f).length, 2);
+});
 
 test("acknowledged receipts survive TTL, and changed turn snapshot cannot reuse an old acknowledgment", () => {
   const f = fixture();
