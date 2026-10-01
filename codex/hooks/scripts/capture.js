@@ -4,7 +4,7 @@ import { runHook } from "./lib/hook-io.js";
 import { resolveIdentity, sanitizeId } from "./lib/identity.js";
 import { createClient, deadline } from "./lib/everos.js";
 import { lastTurnId, parseTranscript, readTurn, toEverosMessages } from "./lib/transcript.js";
-import { readState, isStored, markStored } from "./lib/state.js";
+import { readState, markStored, claimWrite, settleWrite, releaseWrite, writeScope, writeDigest, WRITE_HOLD } from "./lib/state.js";
 import { ADD_MAX_MESSAGES, CAPTURE_DEADLINE_MS } from "./lib/constants.js";
 
 async function readFileOrEmpty(filePath) {
@@ -33,12 +33,6 @@ runHook("Stop", async (input, ctx) => {
     if (!turnId) return undefined;
   }
 
-  // Stop can fire twice for one prompt (interrupt, then resume). EverOS does not dedupe.
-  if (isStored(readState(config.dataDir, sessionId), turnId)) {
-    debug(`already stored: ${turnId}`);
-    return undefined;
-  }
-
   const identity = resolveIdentity(input.cwd ?? process.cwd(), config);
   if (!identity.userId) {
     debug("no user id; skipping capture");
@@ -59,34 +53,39 @@ runHook("Stop", async (input, ctx) => {
 
   const client = createClient({ baseUrl: config.baseUrl });
   const signal = deadline(CAPTURE_DEADLINE_MS);
+  const key = writeDigest(turnId);
+  const snapshot = writeDigest(messages);
   let committed = 0;
-  for (let start = 0; start < messages.length; start += ADD_MAX_MESSAGES) {
-    const batch = messages.slice(start, start + ADD_MAX_MESSAGES);
-    try {
-      await client.add(
-        { session_id: sanitizeId(sessionId, "unknown"), app_id: identity.appId, project_id: identity.projectId, messages: batch },
-        signal,
-      );
-      committed += batch.length;
-    } catch (error) {
-      debug(`add failed at offset ${start}: ${error.message}`);
-      // Nothing got through: leave the prompt unmarked so a re-fired Stop can
-      // retry it. Deliberately no retry here - a 5xx may already have committed
-      // and re-sending would double-write.
-      if (committed === 0) return undefined;
-      // Something did get through. Retrying would re-post the committed batches,
-      // and EverOS assigns message ids server-side so it cannot dedupe them.
-      // A truncated tail is the lesser loss.
-      // ponytail: whole-turn granularity; per-batch resume if long turns start failing here.
-      debug(`partial capture: ${committed} of ${messages.length} messages committed, tail dropped`);
-      break;
+  try {
+    const claim = claimWrite(config.dataDir, writeScope(config, identity, sessionId),
+      { kind: "add", turn: key, snapshot, total: messages.length, batchSize: ADD_MAX_MESSAGES });
+    if (!claim) return WRITE_HOLD;
+    if (claim.journal.captures[key]) {
+      const prior = claim.journal.captures[key];
+      if (prior.snapshot !== snapshot) return WRITE_HOLD;
+      releaseWrite(claim);
+      return undefined;
     }
+    for (let start = 0; start < messages.length; start += ADD_MAX_MESSAGES) {
+      const batch = messages.slice(start, start + ADD_MAX_MESSAGES);
+      const data = await client.add(
+        { session_id: sanitizeId(sessionId, "unknown"), app_id: identity.appId, project_id: identity.projectId, messages: batch }, signal,
+      );
+      if (!["accumulated", "extracted"].includes(data?.status) || data.message_count !== batch.length) {
+        throw new Error("invalid add acknowledgment");
+      }
+      committed += batch.length;
+      claim.journal.captures[key] = { snapshot, acknowledged: committed, total: messages.length, complete: committed === messages.length };
+      claim.journal.revision += 1;
+      // Persist each acknowledged prefix BEFORE another batch can be attempted.
+      settleWrite(claim);
+    }
+    releaseWrite(claim);
+  } catch {
+    debug(`capture UNKNOWN / HOLD; acknowledged prefix ${committed} of ${messages.length}`);
+    return WRITE_HOLD;
   }
-
   markStored(config.dataDir, sessionId, turnId, identity.projectId);
-  // `committed`, not `messages.length`: a partial capture drops the tail, and
-  // telling the user we saved more than we did is the one thing a memory tool
-  // must never do.
   debug(`stored ${committed} of ${messages.length} messages for ${turnId}`);
   return config.verbose ? { systemMessage: `💾 EverOS: saved ${committed} messages` } : undefined;
 });
